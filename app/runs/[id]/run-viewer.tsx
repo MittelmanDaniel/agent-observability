@@ -146,7 +146,7 @@ export function RunViewer({
                 <p className="text-sm font-semibold text-zinc-800 dark:text-zinc-100 leading-tight">
                   {section.label}
                 </p>
-                <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed max-h-36 overflow-y-auto">
+                <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed max-h-64 overflow-y-auto">
                   {section.what_happened}
                 </p>
               </button>

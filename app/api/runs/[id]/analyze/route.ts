@@ -1,6 +1,9 @@
-import { getEvents, getRun } from "@/lib/store";
+import { getRun } from "@/lib/store";
 import { analyzeRun } from "@/lib/analyze";
 import { NextResponse } from "next/server";
+
+// Agent Builder analysis can take 30-60s with multiple tool calls
+export const maxDuration = 120;
 
 export async function POST(
   _request: Request,
@@ -13,17 +16,9 @@ export async function POST(
     return NextResponse.json({ error: "Run not found" }, { status: 404 });
   }
 
-  const events = await getEvents(id);
-  if (events.length === 0) {
-    return NextResponse.json(
-      { error: "No events found for this run" },
-      { status: 400 }
-    );
-  }
-
   try {
-    const sections = await analyzeRun(id, events);
-    return NextResponse.json({ sections });
+    const { sections, agentSteps, usage } = await analyzeRun(id);
+    return NextResponse.json({ sections, agentSteps, usage });
   } catch (err) {
     console.error("Analysis failed:", err);
     return NextResponse.json(

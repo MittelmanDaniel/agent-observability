@@ -53,7 +53,7 @@ export function AnalyzeButton({
       </button>
       {loading && (
         <span className="text-xs text-zinc-400 dark:text-zinc-500">
-          Chunking events → Claude summarization → Jina embedding...
+          Agent is analyzing trajectory (fetching metadata → browsing events → generating sections)...
         </span>
       )}
       {error && (
