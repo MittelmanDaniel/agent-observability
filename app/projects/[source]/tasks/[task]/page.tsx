@@ -89,7 +89,7 @@ export default async function ProjectTaskPage({
               Run clusters
             </h2>
             <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-              Analyzed runs only. Each group = runs whose trajectory summaries are similar (pairwise cosine ≥ 0.85). One group means all analyzed runs were similar; more groups appear when some runs take a different path. The table below is all runs for this task, not by cluster.
+              Analyzed runs only. Each group = runs whose trajectory summaries are similar (pairwise cosine ≥ 0.95). The table below is all runs for this task, not by cluster.
             </p>
             <div className="mt-3 flex flex-wrap gap-3">
               {clusters.map((c) => (
@@ -103,6 +103,11 @@ export default async function ProjectTaskPage({
                   <span className="ml-2 text-xs text-zinc-500 dark:text-zinc-400">
                     ({c.runs.length} run{c.runs.length !== 1 ? "s" : ""})
                   </span>
+                  {c.summary && (
+                    <p className="mt-1 text-xs italic text-zinc-600 dark:text-zinc-400">
+                      {c.summary}
+                    </p>
+                  )}
                   <ul className="mt-1.5 flex flex-wrap gap-1">
                     {c.runIds.slice(0, 8).map((runId) => (
                       <li key={runId}>

@@ -338,6 +338,8 @@ export interface RunCluster {
   groupId: number;
   runIds: string[];
   runs: Run[];
+  /** One-line "what this group is" from sampling up to 5 runs' sections */
+  summary?: string;
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -444,17 +446,71 @@ export async function getRunClusters(options: {
     groupIdToRuns.get(g)!.push(id);
   });
 
-  const clusters: RunCluster[] = [];
+  const SAMPLE_SIZE = 5;
+  const rawClusters: RunCluster[] = [];
   let groupId = 0;
   for (const [, ids] of groupIdToRuns) {
-    clusters.push({
+    const sampleIds = ids.slice(0, SAMPLE_SIZE);
+    const summary = await summarizeClusterFromSections(client, sampleIds);
+    rawClusters.push({
       groupId: ++groupId,
       runIds: ids,
       runs: ids.map((id) => runsByRunId.get(id)!).filter(Boolean),
+      summary,
     });
   }
-  clusters.sort((a, b) => b.runs.length - a.runs.length);
+  rawClusters.sort((a, b) => b.runs.length - a.runs.length);
+
+  // Merge clusters that share the same summary (reranker-style: same "type" = same group)
+  const bySummary = new Map<string, RunCluster>();
+  for (const c of rawClusters) {
+    const key = (c.summary ?? "").trim() || "(no summary)";
+    const existing = bySummary.get(key);
+    if (!existing) {
+      bySummary.set(key, { ...c, runIds: [...c.runIds], runs: [...c.runs] });
+    } else {
+      existing.runIds.push(...c.runIds);
+      existing.runs.push(...c.runs);
+    }
+  }
+  const clusters: RunCluster[] = Array.from(bySummary.values())
+    .sort((a, b) => b.runs.length - a.runs.length)
+    .map((c, i) => ({ ...c, groupId: i + 1 }));
   return clusters;
+}
+
+/** Sample up to 5 runs' sections and return a one-line "what this group is" label. */
+async function summarizeClusterFromSections(
+  client: ReturnType<typeof getElastic>,
+  runIds: string[]
+): Promise<string> {
+  if (runIds.length === 0) return "";
+  const res = await client.search({
+    index: SECTIONS_INDEX,
+    size: 200,
+    query: { terms: { run_id: runIds } },
+    _source: ["label", "what_happened", "verdict"],
+  });
+  type SectionHit = { _source?: { label?: string; what_happened?: string; verdict?: string } };
+  const hits = (res.hits.hits ?? []) as SectionHit[];
+  const text = hits.map((h) => (h._source?.label ?? "") + " " + (h._source?.what_happened ?? "").slice(0, 100) + " " + (h._source?.verdict ?? "")).join(" ").toLowerCase();
+  const verdicts = hits.map((h) => h._source?.verdict ?? "");
+  const failureCount = verdicts.filter((v) => v === "failure").length;
+  const goodCount = verdicts.filter((v) => v === "good").length;
+
+  if ((/stuck|infinite loop|repetitive loop|import.*loop/.test(text) || (failureCount >= 2 && /loop|repeated|typo/.test(text)))) {
+    return "Stuck in a repetitive loop (e.g. import or API errors).";
+  }
+  if (/reproduc/.test(text) && /implementing|implement.*fix|fix and submit/.test(text)) {
+    return "Reproduction attempt then fix.";
+  }
+  if (failureCount > goodCount && failureCount >= 2) {
+    return "Multiple failures or stuck behavior.";
+  }
+  if (/implementing.*fix|implement.*fix|fix and submit/.test(text)) {
+    return "Standard trajectory: find code, implement fix.";
+  }
+  return "Similar trajectory (explore codebase and fix).";
 }
 
 /* -------------------------------------------------------------------------- */
