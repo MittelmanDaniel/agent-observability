@@ -1,16 +1,17 @@
 import type { Event, Run, Section } from "./types";
 
 /* -------------------------------------------------------------------------- */
-/*  Detect mode: Postgres when DATABASE_URL is set, in-memory otherwise       */
+/*  Detect mode: Elasticsearch when env vars set, in-memory otherwise         */
 /* -------------------------------------------------------------------------- */
 
-const USE_DB = !!process.env.DATABASE_URL;
+const USE_ES =
+  !!process.env.ELASTICSEARCH_URL && !!process.env.ELASTICSEARCH_API_KEY;
 
-/* ============================== Postgres ==================================*/
+/* ============================== Elasticsearch ==============================*/
 
-async function pgSql() {
-  const { neon } = await import("@neondatabase/serverless");
-  return neon(process.env.DATABASE_URL!);
+async function es() {
+  const { getElastic } = await import("./db");
+  return getElastic();
 }
 
 /* ============================== In-memory ==================================*/
@@ -54,20 +55,53 @@ export interface TaskSummary {
 }
 
 export async function listTaskSummaries(): Promise<TaskSummary[]> {
-  if (USE_DB) {
-    const sql = await pgSql();
-    const rows = await sql`
-      SELECT
-        task,
-        COUNT(*)::int AS runs,
-        COUNT(*) FILTER (WHERE status = 'succeeded')::int AS succeeded,
-        COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
-        MAX(started_at)::text AS latest_started_at
-      FROM runs
-      GROUP BY task
-      ORDER BY MAX(started_at) DESC
-    `;
-    return rows as TaskSummary[];
+  if (USE_ES) {
+    const client = await es();
+    const result = await client.search({
+      index: "runs",
+      size: 0,
+      aggs: {
+        by_task: {
+          terms: { field: "task", size: 1000 },
+          aggs: {
+            succeeded: {
+              filter: { term: { status: "succeeded" } },
+            },
+            failed: {
+              filter: { term: { status: "failed" } },
+            },
+            latest: {
+              max: { field: "started_at" },
+            },
+          },
+        },
+      },
+    });
+    const buckets = (
+      result.aggregations?.by_task as {
+        buckets: Array<{
+          key: string;
+          doc_count: number;
+          succeeded: { doc_count: number };
+          failed: { doc_count: number };
+          latest: { value_as_string: string };
+        }>;
+      }
+    ).buckets;
+
+    return buckets
+      .map((b) => ({
+        task: b.key,
+        runs: b.doc_count,
+        succeeded: b.succeeded.doc_count,
+        failed: b.failed.doc_count,
+        latest_started_at: b.latest.value_as_string,
+      }))
+      .sort(
+        (a, b) =>
+          new Date(b.latest_started_at).getTime() -
+          new Date(a.latest_started_at).getTime()
+      );
   }
 
   seedFromFile();
@@ -102,16 +136,15 @@ export async function listTaskSummaries(): Promise<TaskSummary[]> {
 }
 
 export async function listRuns(): Promise<Run[]> {
-  if (USE_DB) {
-    const sql = await pgSql();
-    const rows = await sql`
-      SELECT id, source, task, status,
-             started_at::text AS started_at,
-             ended_at::text AS ended_at
-      FROM runs
-      ORDER BY started_at DESC
-    `;
-    return rows as Run[];
+  if (USE_ES) {
+    const client = await es();
+    const result = await client.search({
+      index: "runs",
+      size: 1000,
+      sort: [{ started_at: "desc" }],
+      _source: ["id", "source", "task", "status", "started_at", "ended_at"],
+    });
+    return result.hits.hits.map((h) => h._source as Run);
   }
 
   seedFromFile();
@@ -122,17 +155,16 @@ export async function listRuns(): Promise<Run[]> {
 }
 
 export async function getRunsByTask(task: string): Promise<Run[]> {
-  if (USE_DB) {
-    const sql = await pgSql();
-    const rows = await sql`
-      SELECT id, source, task, status,
-             started_at::text AS started_at,
-             ended_at::text AS ended_at
-      FROM runs
-      WHERE task = ${task}
-      ORDER BY started_at DESC
-    `;
-    return rows as Run[];
+  if (USE_ES) {
+    const client = await es();
+    const result = await client.search({
+      index: "runs",
+      size: 1000,
+      query: { term: { task } },
+      sort: [{ started_at: "desc" }],
+      _source: ["id", "source", "task", "status", "started_at", "ended_at"],
+    });
+    return result.hits.hits.map((h) => h._source as Run);
   }
 
   seedFromFile();
@@ -145,17 +177,14 @@ export async function getRunsByTask(task: string): Promise<Run[]> {
 }
 
 export async function getRun(id: string): Promise<Run | undefined> {
-  if (USE_DB) {
-    const sql = await pgSql();
-    const rows = await sql`
-      SELECT id, source, task, status,
-             started_at::text AS started_at,
-             ended_at::text AS ended_at
-      FROM runs
-      WHERE id = ${id}
-      LIMIT 1
-    `;
-    return (rows[0] as Run) ?? undefined;
+  if (USE_ES) {
+    const client = await es();
+    try {
+      const result = await client.get({ index: "runs", id });
+      return result._source as Run;
+    } catch {
+      return undefined;
+    }
   }
 
   seedFromFile();
@@ -163,15 +192,16 @@ export async function getRun(id: string): Promise<Run | undefined> {
 }
 
 export async function getEvents(runId: string): Promise<Event[]> {
-  if (USE_DB) {
-    const sql = await pgSql();
-    const rows = await sql`
-      SELECT id::text, run_id, idx, ts::text, type, actor, content, metadata
-      FROM events
-      WHERE run_id = ${runId}
-      ORDER BY idx ASC
-    `;
-    return rows as Event[];
+  if (USE_ES) {
+    const client = await es();
+    const result = await client.search({
+      index: "events",
+      size: 10000,
+      query: { term: { run_id: runId } },
+      sort: [{ idx: "asc" }],
+      _source: ["run_id", "idx", "ts", "type", "actor", "content", "metadata"],
+    });
+    return result.hits.hits.map((h) => h._source as Event);
   }
 
   seedFromFile();
@@ -183,17 +213,22 @@ export async function createRun(
   run: Run,
   eventList: Omit<Event, "run_id" | "id">[]
 ): Promise<Run> {
-  if (USE_DB) {
-    const sql = await pgSql();
-    await sql`
-      INSERT INTO runs (id, source, task, status, started_at, ended_at)
-      VALUES (${run.id}, ${run.source}, ${run.task}, ${run.status}, ${run.started_at}, ${run.ended_at})
-    `;
-    for (const e of eventList) {
-      await sql`
-        INSERT INTO events (run_id, idx, ts, type, actor, content, metadata)
-        VALUES (${run.id}, ${e.idx}, ${e.ts}, ${e.type}, ${e.actor}, ${e.content}, ${JSON.stringify(e.metadata ?? null)})
-      `;
+  if (USE_ES) {
+    const client = await es();
+    // Index the run document
+    await client.index({
+      index: "runs",
+      id: run.id,
+      document: run,
+      refresh: "wait_for",
+    });
+    // Bulk index events
+    if (eventList.length > 0) {
+      const operations = eventList.flatMap((e) => [
+        { index: { _index: "events" } },
+        { ...e, run_id: run.id },
+      ]);
+      await client.bulk({ operations, refresh: "wait_for" });
     }
     return run;
   }
@@ -209,13 +244,14 @@ export async function addEvents(
   runId: string,
   eventList: Omit<Event, "run_id" | "id">[]
 ): Promise<void> {
-  if (USE_DB) {
-    const sql = await pgSql();
-    for (const e of eventList) {
-      await sql`
-        INSERT INTO events (run_id, idx, ts, type, actor, content, metadata)
-        VALUES (${runId}, ${e.idx}, ${e.ts}, ${e.type}, ${e.actor}, ${e.content}, ${JSON.stringify(e.metadata ?? null)})
-      `;
+  if (USE_ES) {
+    const client = await es();
+    if (eventList.length > 0) {
+      const operations = eventList.flatMap((e) => [
+        { index: { _index: "events" } },
+        { ...e, run_id: runId },
+      ]);
+      await client.bulk({ operations, refresh: "wait_for" });
     }
     return;
   }
@@ -226,37 +262,50 @@ export async function addEvents(
   memEvents.set(runId, [...existing, ...withRunId]);
 }
 
-/* Sections (for Phase 3) */
+/* Sections */
 
 export async function getSections(runId: string): Promise<Section[]> {
-  if (USE_DB) {
-    const sql = await pgSql();
-    const rows = await sql`
-      SELECT id, run_id, start_idx, end_idx, label, what_happened,
-             verdict, root_cause_guess, fix_suggestion, confidence
-      FROM sections
-      WHERE run_id = ${runId}
-      ORDER BY start_idx ASC
-    `;
-    return rows as Section[];
+  if (USE_ES) {
+    const client = await es();
+    const result = await client.search({
+      index: "sections",
+      size: 1000,
+      query: { term: { run_id: runId } },
+      sort: [{ start_idx: "asc" }],
+    });
+    return result.hits.hits.map((h) => h._source as Section);
   }
   return [];
 }
 
 export async function saveSections(sections: Section[]): Promise<void> {
-  if (!USE_DB || sections.length === 0) return;
-  const sql = await pgSql();
-  for (const s of sections) {
-    await sql`
-      INSERT INTO sections (id, run_id, start_idx, end_idx, label, what_happened, verdict, root_cause_guess, fix_suggestion, confidence)
-      VALUES (${s.id}, ${s.run_id}, ${s.start_idx}, ${s.end_idx}, ${s.label}, ${s.what_happened}, ${s.verdict}, ${s.root_cause_guess ?? null}, ${s.fix_suggestion ?? null}, ${s.confidence ?? null})
-      ON CONFLICT (id) DO UPDATE SET
-        label = EXCLUDED.label,
-        what_happened = EXCLUDED.what_happened,
-        verdict = EXCLUDED.verdict,
-        root_cause_guess = EXCLUDED.root_cause_guess,
-        fix_suggestion = EXCLUDED.fix_suggestion,
-        confidence = EXCLUDED.confidence
-    `;
-  }
+  if (!USE_ES || sections.length === 0) return;
+  const client = await es();
+  const operations = sections.flatMap((s) => [
+    { index: { _index: "sections", _id: s.id } },
+    s,
+  ]);
+  await client.bulk({ operations, refresh: "wait_for" });
+}
+
+/* Full-text search across events (bonus: free with ES!) */
+
+export async function searchEvents(
+  query: string,
+  limit = 50
+): Promise<(Event & { _score: number })[]> {
+  if (!USE_ES) return [];
+  const client = await es();
+  const result = await client.search({
+    index: "events",
+    size: limit,
+    query: {
+      match: { content: { query, fuzziness: "AUTO" } },
+    },
+    _source: ["run_id", "idx", "ts", "type", "actor", "content"],
+  });
+  return result.hits.hits.map((h) => ({
+    ...(h._source as Event),
+    _score: h._score ?? 0,
+  }));
 }

@@ -1,7 +1,8 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { getEvents, getRun } from "@/lib/store";
+import { getEvents, getRun, getSections } from "@/lib/store";
 import { MessageRow } from "./message-row";
+import { AnalyzeButton } from "./analyze-button";
 
 export default async function RunPage({
   params,
@@ -12,6 +13,7 @@ export default async function RunPage({
   const run = await getRun(id);
   if (!run) notFound();
   const events = await getEvents(id);
+  const sections = await getSections(id);
 
   return (
     <div className="min-h-screen bg-zinc-50 font-sans dark:bg-zinc-950">
@@ -31,6 +33,12 @@ export default async function RunPage({
           </p>
         </header>
 
+        {/* Sections (analysis) */}
+        <section className="mt-8">
+          <AnalyzeButton runId={id} initialSections={sections} />
+        </section>
+
+        {/* Raw timeline */}
         <section className="mt-8">
           <h2 className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
             Timeline ({events.length} events)
