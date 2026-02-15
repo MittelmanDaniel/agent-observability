@@ -15,7 +15,10 @@ export type EventType =
   | "tool_result"
   | "thought"
   | "error"
-  | "user_feedback";
+  | "user_feedback"
+  | "system"
+  | "ai"
+  | "user";
 
 export interface Event {
   id?: string;
