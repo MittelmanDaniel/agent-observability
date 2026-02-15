@@ -5,6 +5,7 @@ import { getProjectMeta } from "@/lib/projects";
 import { parseSWEBenchTask } from "@/lib/github";
 import { getRunClusters } from "@/lib/analyze";
 import { RunsTable } from "./runs-table";
+import { NewRunButton } from "./new-run-button";
 
 export default async function ProjectTaskPage({
   params,
@@ -82,6 +83,13 @@ export default async function ProjectTaskPage({
             </div>
           )}
         </header>
+
+        {/* New SWE-Agent run launcher (only for SWE-bench tasks) */}
+        {githubInfo && (
+          <div className="mb-6">
+            <NewRunButton task={task} />
+          </div>
+        )}
 
         {clusters.length > 0 && (
           <div className="mb-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
