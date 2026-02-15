@@ -226,6 +226,97 @@ export async function listTaskSummaries(source?: string): Promise<TaskSummary[]>
   );
 }
 
+export interface TaskLengthStats {
+  task: string;
+  runs: number;
+  avgEvents: number;
+  maxEvents: number;
+}
+
+/** Task trajectory length (avg/max events per run) for sorting by "longest first". */
+export async function getTaskLengthStats(
+  source: string
+): Promise<TaskLengthStats[]> {
+  if (USE_ES) {
+    const client = await es();
+    const runsRes = await client.search({
+      index: "runs",
+      size: 10000,
+      query: { term: { source } },
+      _source: ["id", "task"],
+    });
+    const runIdToTask = new Map<string, string>();
+    for (const h of runsRes.hits.hits as Array<{
+      _id: string;
+      _source?: { id?: string; task: string };
+    }>) {
+      const id = h._source?.id ?? h._id;
+      runIdToTask.set(id, h._source?.task ?? "");
+    }
+    const eventsRes = await client.search({
+      index: "events",
+      size: 0,
+      aggs: {
+        by_run: { terms: { field: "run_id", size: 10000 } },
+      },
+    });
+    const buckets =
+      (eventsRes.aggregations?.by_run as {
+        buckets: Array<{ key: string; doc_count: number }>;
+      })?.buckets ?? [];
+    const runIdToCount = new Map<string, number>();
+    for (const b of buckets) runIdToCount.set(b.key, b.doc_count);
+    const byTask = new Map<
+      string,
+      { runs: number; totalEvents: number; maxEvents: number }
+    >();
+    for (const [runId, task] of runIdToTask) {
+      const events = runIdToCount.get(runId) ?? 0;
+      const cur = byTask.get(task);
+      if (!cur) {
+        byTask.set(task, { runs: 1, totalEvents: events, maxEvents: events });
+      } else {
+        cur.runs += 1;
+        cur.totalEvents += events;
+        cur.maxEvents = Math.max(cur.maxEvents, events);
+      }
+    }
+    return Array.from(byTask.entries())
+      .map(([task, v]) => ({
+        task,
+        runs: v.runs,
+        avgEvents: Math.round((v.totalEvents / v.runs) * 10) / 10,
+        maxEvents: v.maxEvents,
+      }))
+      .sort((a, b) => b.avgEvents - a.avgEvents);
+  }
+  seedFromFile();
+  const byTask = new Map<
+    string,
+    { runs: number; totalEvents: number; maxEvents: number }
+  >();
+  for (const run of memRuns.values()) {
+    if (run.source !== source) continue;
+    const events = (memEvents.get(run.id) ?? []).length;
+    const cur = byTask.get(run.task);
+    if (!cur) {
+      byTask.set(run.task, { runs: 1, totalEvents: events, maxEvents: events });
+    } else {
+      cur.runs += 1;
+      cur.totalEvents += events;
+      cur.maxEvents = Math.max(cur.maxEvents, events);
+    }
+  }
+  return Array.from(byTask.entries())
+    .map(([task, v]) => ({
+      task,
+      runs: v.runs,
+      avgEvents: Math.round((v.totalEvents / v.runs) * 10) / 10,
+      maxEvents: v.maxEvents,
+    }))
+    .sort((a, b) => b.avgEvents - a.avgEvents);
+}
+
 export async function listRuns(): Promise<Run[]> {
   if (USE_ES) {
     const client = await es();

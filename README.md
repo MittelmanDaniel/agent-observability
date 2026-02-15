@@ -1,5 +1,17 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Environment (.env.local)
+
+| Variable | Purpose |
+|----------|---------|
+| `ELASTICSEARCH_URL` | Elasticsearch cluster for index/search (runs, events, sections). Example: `https://….es.us-west1.gcp.elastic.cloud:443` |
+| `ELASTICSEARCH_API_KEY` | API key for Elasticsearch (and for Kibana Agent Builder API). |
+| `KIBANA_URL` | Kibana instance **only** used for the Agent Builder REST API (converse, tools, agents). Not used for dashboards or inference. Example: `https://….kb.us-west1.gcp.elastic.cloud:443` |
+| `ELASTIC_AGENT_CONNECTOR_ID` | Optional. Connector ID for the LLM used by the trajectory-analyzer agent (converse API). If unset, Kibana uses its **default** connector (often set in Stack Management → Connectors or Agent Builder / GenAI settings). Set this to pin the run analyzer to a specific model. |
+| `JINA_API_KEY` | **Required** for run analysis. Section embeddings use [Jina AI’s API](https://jina.ai/embeddings) (`https://api.jina.ai/v1/embeddings`). If missing, analysis fails with a clear error. Get a key at [jina.ai](https://jina.ai/?sui=apikey). |
+
+To list Kibana connectors (for `ELASTIC_AGENT_CONNECTOR_ID`): `npx tsx scripts/list-connectors.ts`
+
 ## Getting Started
 
 First, run the development server:

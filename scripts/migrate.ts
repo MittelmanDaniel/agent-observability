@@ -31,6 +31,12 @@ async function migrate() {
 
   // --- runs index ---
   const runsExists = await client.indices.exists({ index: "runs" });
+  const runsEmbeddingMapping = {
+    type: "dense_vector" as const,
+    dims: 768,
+    index: true,
+    similarity: "cosine" as const,
+  };
   if (!runsExists) {
     console.log("Creating 'runs' index...");
     await client.indices.create({
@@ -43,11 +49,25 @@ async function migrate() {
           status: { type: "keyword" },
           started_at: { type: "date" },
           ended_at: { type: "date" },
+          embedding: runsEmbeddingMapping,
         },
       },
     });
   } else {
     console.log("'runs' index already exists.");
+    try {
+      await client.indices.putMapping({
+        index: "runs",
+        properties: { embedding: runsEmbeddingMapping },
+      });
+      console.log("Updated 'runs' mapping with embedding field.");
+    } catch (e) {
+      if (String(e).includes("resource_already_exists") || String(e).includes("mapper")) {
+        console.log("'runs' embedding field may already exist.");
+      } else {
+        throw e;
+      }
+    }
   }
 
   // --- events index ---
@@ -72,36 +92,44 @@ async function migrate() {
     console.log("'events' index already exists.");
   }
 
-  // --- sections index ---
+  // --- sections index (embedding must be 768 for Jina) ---
+  const SECTIONS_EMBEDDING_DIMS = 768;
+  const sectionsMapping = {
+    properties: {
+      id: { type: "keyword" },
+      run_id: { type: "keyword" },
+      start_idx: { type: "integer" },
+      end_idx: { type: "integer" },
+      label: { type: "text", fields: { keyword: { type: "keyword" } } },
+      what_happened: { type: "text" },
+      verdict: { type: "keyword" },
+      root_cause_guess: { type: "text" },
+      fix_suggestion: { type: "text" },
+      confidence: { type: "float" },
+      embedding: {
+        type: "dense_vector" as const,
+        dims: SECTIONS_EMBEDDING_DIMS,
+        index: true,
+        similarity: "cosine" as const,
+      },
+    },
+  };
+
   const sectionsExists = await client.indices.exists({ index: "sections" });
   if (!sectionsExists) {
     console.log("Creating 'sections' index...");
-    await client.indices.create({
-      index: "sections",
-      mappings: {
-        properties: {
-          id: { type: "keyword" },
-          run_id: { type: "keyword" },
-          start_idx: { type: "integer" },
-          end_idx: { type: "integer" },
-          label: { type: "text", fields: { keyword: { type: "keyword" } } },
-          what_happened: { type: "text" },
-          verdict: { type: "keyword" },
-          root_cause_guess: { type: "text" },
-          fix_suggestion: { type: "text" },
-          confidence: { type: "float" },
-          // Vector field for similarity search (Phase 5)
-          embedding: {
-            type: "dense_vector",
-            dims: 768,
-            index: true,
-            similarity: "cosine",
-          },
-        },
-      },
-    });
+    await client.indices.create({ index: "sections", mappings: sectionsMapping });
   } else {
-    console.log("'sections' index already exists.");
+    const current = await client.indices.getMapping({ index: "sections" });
+    const embeddingDims = (current.sections?.mappings?.properties?.embedding as { dims?: number })?.dims;
+    if (embeddingDims !== SECTIONS_EMBEDDING_DIMS) {
+      console.log(`'sections' index has embedding dims=${embeddingDims}; we need ${SECTIONS_EMBEDDING_DIMS}. Deleting and recreating...`);
+      await client.indices.delete({ index: "sections" });
+      await client.indices.create({ index: "sections", mappings: sectionsMapping });
+      console.log("Recreated 'sections' index with 768-dim embedding (Jina).");
+    } else {
+      console.log("'sections' index already exists with correct embedding dims.");
+    }
   }
 
   console.log("Migration complete.");

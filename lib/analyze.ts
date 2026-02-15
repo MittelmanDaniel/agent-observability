@@ -1,14 +1,27 @@
-import type { Section } from "./types";
-import { getElastic, SECTIONS_INDEX } from "./db";
+import type { Run, Section } from "./types";
+import { getElastic, RUNS_INDEX, SECTIONS_INDEX } from "./db";
 
 /* -------------------------------------------------------------------------- */
-/*  Agent Builder configuration                                               */
+/*  Agent Builder (Kibana) — converse API only                                 */
+/*  KIBANA_URL = Kibana instance (dashboard app). We use it only for the      */
+/*  Agent Builder REST API: /api/agent_builder/converse, not for dashboards.  */
 /* -------------------------------------------------------------------------- */
 
 const KIBANA_URL = process.env.KIBANA_URL;
 const API_KEY = process.env.ELASTICSEARCH_API_KEY;
+/** Optional: connector ID for the LLM (see Kibana → Agent Builder / GenAI settings). If unset, Kibana uses its default. */
+const AGENT_CONNECTOR_ID = process.env.ELASTIC_AGENT_CONNECTOR_ID;
 
 const AGENT_ID = "trajectory-analyzer";
+
+/* -------------------------------------------------------------------------- */
+/*  Embeddings — Jina AI API only (https://api.jina.ai/v1/embeddings)         */
+/*  JINA_API_KEY is required. No fallback — if missing we throw.              */
+/*  Sections index expects 768-dim vectors (see scripts/migrate.ts).          */
+/* -------------------------------------------------------------------------- */
+
+const JINA_EMBEDDINGS_URL = "https://api.jina.ai/v1/embeddings";
+const EMBEDDING_DIMS = 768;
 
 /* -------------------------------------------------------------------------- */
 /*  Step 1: Call Trajectory Analyzer agent via Agent Builder converse API      */
@@ -67,6 +80,7 @@ async function sectionsFromAgent(runId: string): Promise<{
     body: JSON.stringify({
       input: `Analyze run_id: ${runId}`,
       agent_id: AGENT_ID,
+      ...(AGENT_CONNECTOR_ID && { connector_id: AGENT_CONNECTOR_ID }),
     }),
   });
 
@@ -150,21 +164,42 @@ async function sectionsFromAgent(runId: string): Promise<{
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Step 2: Embed section with Jina via ES Inference API                      */
+/*  Step 2: Embed section via Jina AI API (required)                           */
 /* -------------------------------------------------------------------------- */
 
-async function embedSection(text: string): Promise<number[]> {
-  const client = getElastic();
-  const result = await client.transport.request({
-    method: "POST",
-    path: "/_inference/text_embedding/.jina-embeddings-v3",
-    body: {
-      input: [text],
-    },
-  });
+function getJinaApiKey(): string {
+  const key = process.env.JINA_API_KEY;
+  if (!key || key.trim() === "") {
+    throw new Error(
+      "JINA_API_KEY is not set. Add it to .env.local to enable section embeddings. Get a key at https://jina.ai/"
+    );
+  }
+  return key;
+}
 
-  return (result as { text_embedding: Array<{ embedding: number[] }> })
-    .text_embedding[0].embedding;
+async function embedSection(text: string): Promise<number[]> {
+  const apiKey = getJinaApiKey();
+  const res = await fetch(JINA_EMBEDDINGS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      model: "jina-embeddings-v3",
+      input: [text],
+      dimensions: EMBEDDING_DIMS,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Jina embeddings API failed: ${res.status} ${err}`);
+  }
+  const data = (await res.json()) as {
+    data: Array<{ embedding: number[] }>;
+  };
+  return data.data[0].embedding;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -230,11 +265,192 @@ export async function analyzeRun(
 
   await client.indices.refresh({ index: SECTIONS_INDEX });
 
+  // Embed run summary (section titles + summaries) for similar-runs clustering
+  const runSummaryText = llmSections
+    .map((s, i) => `${i + 1}) ${s.title}: ${s.summary}`)
+    .join(". ");
+  const runEmbedding = await embedSection(runSummaryText);
+  await client.update({
+    index: RUNS_INDEX,
+    id: runId,
+    doc: { embedding: runEmbedding },
+  });
+
   return { sections, agentSteps: steps, usage };
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Bonus: Find similar sections using Jina embeddings + k-NN                 */
+/*  Find similar runs using Jina run-summary embeddings + k-NN                */
+/* -------------------------------------------------------------------------- */
+
+export async function findSimilarRuns(
+  runId: string,
+  limit = 8
+): Promise<Array<Run & { _score: number }>> {
+  const client = getElastic();
+
+  const runDoc = await client.get({ index: RUNS_INDEX, id: runId });
+  const embedding = (runDoc._source as { embedding?: number[] })?.embedding;
+  if (!embedding) return [];
+
+  const result = await client.search({
+    index: RUNS_INDEX,
+    size: limit + 1,
+    knn: {
+      field: "embedding",
+      query_vector: embedding,
+      k: limit + 1,
+      num_candidates: 100,
+    },
+    _source: [
+      "id",
+      "source",
+      "task",
+      "status",
+      "started_at",
+      "ended_at",
+      "model_name",
+      "exit_status",
+    ],
+  });
+
+  return result.hits.hits
+    .filter((h) => h._id !== runId)
+    .slice(0, limit)
+    .map((h) => ({
+      ...(h._source as Run),
+      _score: h._score ?? 0,
+    }));
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Cluster all runs into groups by embedding similarity (connected comps)  */
+/* -------------------------------------------------------------------------- */
+
+export interface RunCluster {
+  groupId: number;
+  runIds: string[];
+  runs: Run[];
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length !== b.length) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+function connectedComponents(
+  runIds: string[],
+  embeddingByRunId: Map<string, number[]>,
+  threshold: number
+): number[] {
+  const n = runIds.length;
+  const idToIdx = new Map(runIds.map((id, i) => [id, i]));
+  const parent = runIds.map((_, i) => i);
+
+  function find(x: number): number {
+    if (parent[x] !== x) parent[x] = find(parent[x]);
+    return parent[x];
+  }
+  function union(x: number, y: number) {
+    parent[find(x)] = find(y);
+  }
+
+  for (let i = 0; i < n; i++) {
+    const a = embeddingByRunId.get(runIds[i]);
+    if (!a) continue;
+    for (let j = i + 1; j < n; j++) {
+      const b = embeddingByRunId.get(runIds[j]);
+      if (!b) continue;
+      if (cosineSimilarity(a, b) >= threshold) union(i, j);
+    }
+  }
+
+  const rootToGroupId = new Map<number, number>();
+  let nextId = 0;
+  return runIds.map((_, i) => {
+    const r = find(i);
+    if (!rootToGroupId.has(r)) rootToGroupId.set(r, nextId++);
+    return rootToGroupId.get(r)!;
+  });
+}
+
+export async function getRunClusters(options: {
+  task?: string;
+  source?: string;
+  similarityThreshold?: number;
+}): Promise<RunCluster[]> {
+  const { task, source, similarityThreshold = 0.85 } = options;
+  const client = getElastic();
+
+  const must: Record<string, unknown>[] = [{ exists: { field: "embedding" } }];
+  if (task) must.push({ term: { task } });
+  if (source) must.push({ term: { source } });
+
+  const result = await client.search({
+    index: RUNS_INDEX,
+    size: 5000,
+    query: { bool: { must } },
+    _source: ["id", "embedding", "source", "task", "status", "started_at", "ended_at", "model_name", "exit_status"],
+  });
+
+  const hits = result.hits.hits as Array<{
+    _id: string;
+    _source: Run & { embedding?: number[] };
+  }>;
+  const runIds = hits.map((h) => h._id);
+  if (runIds.length === 0) return [];
+
+  const embeddingByRunId = new Map<string, number[]>();
+  const runsByRunId = new Map<string, Run>();
+  for (const h of hits) {
+    const src = h._source;
+    if (src.embedding) {
+      embeddingByRunId.set(h._id, src.embedding);
+      const { embedding: _, ...run } = src;
+      runsByRunId.set(h._id, run);
+    }
+  }
+
+  const runIdsWithEmbedding = runIds.filter((id) => embeddingByRunId.has(id));
+  if (runIdsWithEmbedding.length === 0) return [];
+
+  const groupIds = connectedComponents(
+    runIdsWithEmbedding,
+    embeddingByRunId,
+    similarityThreshold
+  );
+
+  const groupIdToRuns = new Map<number, string[]>();
+  runIdsWithEmbedding.forEach((id, i) => {
+    const g = groupIds[i];
+    if (!groupIdToRuns.has(g)) groupIdToRuns.set(g, []);
+    groupIdToRuns.get(g)!.push(id);
+  });
+
+  const clusters: RunCluster[] = [];
+  let groupId = 0;
+  for (const [, ids] of groupIdToRuns) {
+    clusters.push({
+      groupId: ++groupId,
+      runIds: ids,
+      runs: ids.map((id) => runsByRunId.get(id)!).filter(Boolean),
+    });
+  }
+  clusters.sort((a, b) => b.runs.length - a.runs.length);
+  return clusters;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Find similar sections using Jina embeddings + k-NN                        */
 /* -------------------------------------------------------------------------- */
 
 export async function findSimilarSections(
