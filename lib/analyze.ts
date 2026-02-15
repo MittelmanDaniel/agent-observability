@@ -265,10 +265,17 @@ export async function analyzeRun(
 
   await client.indices.refresh({ index: SECTIONS_INDEX });
 
-  // Embed run summary (section titles + summaries) for similar-runs clustering
-  const runSummaryText = llmSections
-    .map((s, i) => `${i + 1}) ${s.title}: ${s.summary}`)
-    .join(". ");
+  // Embed run summary (outcome + section titles + summaries) so failed vs succeeded
+  // runs tend to cluster separately
+  const runDoc = await client.get({ index: RUNS_INDEX, id: runId });
+  const runMeta = runDoc._source as { status?: string; eval_score?: number | null };
+  const outcome =
+    `Outcome: ${runMeta.status ?? "unknown"}${runMeta.eval_score != null ? `, eval score ${runMeta.eval_score}` : ""}. `;
+  const runSummaryText =
+    outcome +
+    llmSections
+      .map((s, i) => `${i + 1}) ${s.title}: ${s.summary}`)
+      .join(". ");
   const runEmbedding = await embedSection(runSummaryText);
   await client.update({
     index: RUNS_INDEX,
@@ -388,7 +395,8 @@ export async function getRunClusters(options: {
   source?: string;
   similarityThreshold?: number;
 }): Promise<RunCluster[]> {
-  const { task, source, similarityThreshold = 0.85 } = options;
+  // Default 0.95. Run: npx tsx scripts/similarity-distribution.ts [task] [source] to inspect distribution.
+  const { task, source, similarityThreshold = 0.95 } = options;
   const client = getElastic();
 
   const must: Record<string, unknown>[] = [{ exists: { field: "embedding" } }];

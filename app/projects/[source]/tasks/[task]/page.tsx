@@ -86,10 +86,10 @@ export default async function ProjectTaskPage({
         {clusters.length > 0 && (
           <div className="mb-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
             <h2 className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
-              Run clusters (similar runs grouped by Jina embeddings)
+              Run clusters
             </h2>
             <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-              Runs that have been analyzed are grouped by embedding similarity. Only analyzed runs appear here.
+              Analyzed runs only. Each group = runs whose trajectory summaries are similar (pairwise cosine ≥ 0.85). One group means all analyzed runs were similar; more groups appear when some runs take a different path. The table below is all runs for this task, not by cluster.
             </p>
             <div className="mt-3 flex flex-wrap gap-3">
               {clusters.map((c) => (
