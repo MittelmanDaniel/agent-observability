@@ -1,0 +1,4 @@
+# Load Hugging Face trajectory datasets and normalize to our schema.
+datasets>=2.14.0
+huggingface_hub>=0.20.0
+requests>=2.28.0

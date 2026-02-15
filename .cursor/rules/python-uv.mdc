@@ -1,0 +1,26 @@
+---
+description: Use uv for all Python tooling in this project
+alwaysApply: true
+---
+
+# Python: use uv only
+
+For any Python work in this repo:
+
+- **Do not** use `python3`, `pip`, or `python -m venv`.
+- **Use uv** for creating venvs, installing dependencies, and running scripts.
+
+Examples:
+
+- Create venv: `uv venv` (not `python3 -m venv .venv`)
+- Install deps: `uv pip install -r scripts/requirements.txt` (not `pip install ...`)
+- Run a script: `uv run python scripts/load_trajectories.py ...` (or activate `.venv` and use `uv run`)
+
+When suggesting commands or editing docs/scripts, always use `uv` (e.g. `uv venv`, `uv pip install`, `uv run`).
+
+# Data Integrity: do not truncate dataset contents in scripts
+
+- In ingestion/export scripts, preserve full source content by default.
+- Do **not** truncate long text fields when writing dataset files or posting events.
+- Truncation is allowed only for **agent-facing display/readability** (UI previews, log snippets), never for stored script outputs.
+- If a cap is needed for operational reasons, make it explicit via an opt-in CLI flag and default to no truncation.
