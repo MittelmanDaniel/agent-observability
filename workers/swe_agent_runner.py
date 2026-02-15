@@ -34,6 +34,7 @@ app = modal.App("swe-agent-runner")
 
 # SWE-agent requires repo root with config/, tools/, trajectories/ (see sweagent/__init__.py).
 # pip install from git only installs the package, so we clone and editable-install.
+# run_with_drop_params.py sets litellm.drop_params=True so GPT-5 / Claude don't error on top_p.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
@@ -41,6 +42,10 @@ image = (
         "git clone --depth 1 https://github.com/SWE-agent/SWE-agent.git /opt/swe-agent",
         "pip install -e /opt/swe-agent",
         "pip install 'swe-rex[modal]' modal elasticsearch",
+    )
+    .add_local_file(
+        "workers/run_with_drop_params.py",
+        "/opt/swe-agent/run_with_drop_params.py",
     )
 )
 
@@ -94,8 +99,9 @@ def run_swe_agent(
     workdir = "/tmp/sweagent-run"
     os.makedirs(workdir, exist_ok=True)
 
+    # Use wrapper so litellm.drop_params=True (avoids top_p / temperature errors for GPT-5, Claude, etc.)
     cmd = [
-        "sweagent", "run",
+        "python", "/opt/swe-agent/run_with_drop_params.py", "run",
         f"--agent.model.name={model}",
         f"--agent.model.per_instance_cost_limit={cost_limit}",
         f"--env.repo.github_url={github_url}",
