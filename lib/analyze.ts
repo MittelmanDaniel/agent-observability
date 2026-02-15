@@ -2,84 +2,8 @@ import type { Event, Section } from "./types";
 import { getElastic, SECTIONS_INDEX } from "./db";
 
 /* -------------------------------------------------------------------------- */
-/*  Step 1: Heuristic pre-chunking — split events at natural boundaries       */
+/*  Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
-
-interface Chunk {
-  startIdx: number;
-  endIdx: number;
-  events: Event[];
-}
-
-/**
- * Split events into rough chunks at natural section boundaries:
- * - After errors/tracebacks in tool results
- * - When the agent tries a different approach (command type changes)
- * - After "submit" or cleanup commands
- * - Cap chunk size at ~15 events to keep LLM calls manageable
- */
-export function chunkEvents(events: Event[]): Chunk[] {
-  if (events.length === 0) return [];
-
-  const chunks: Chunk[] = [];
-  let currentChunk: Event[] = [];
-  let chunkStart = events[0].idx;
-
-  for (let i = 0; i < events.length; i++) {
-    const event = events[i];
-    currentChunk.push(event);
-
-    const isLast = i === events.length - 1;
-    let shouldBreak = false;
-
-    if (!isLast) {
-      // Break after error tracebacks in tool results
-      const contentLower = getContentText(event).toLowerCase();
-      if (
-        event.type === "user" &&
-        (contentLower.includes("traceback") ||
-          contentLower.includes("error:") ||
-          contentLower.includes("exception:"))
-      ) {
-        shouldBreak = true;
-      }
-
-      // Break after submit/cleanup commands in AI messages
-      if (event.type === "ai") {
-        const text = getContentText(event);
-        if (/\b(submit|rm |exit)\b/.test(text)) {
-          shouldBreak = true;
-        }
-      }
-
-      // Break if chunk is getting large (cap at ~12 events = ~6 AI+result pairs)
-      if (currentChunk.length >= 12) {
-        // Try to break at an AI message boundary (after a tool result)
-        if (event.type === "user" && i + 1 < events.length && events[i + 1].type === "ai") {
-          shouldBreak = true;
-        }
-        // Force break at 16
-        if (currentChunk.length >= 16) {
-          shouldBreak = true;
-        }
-      }
-    }
-
-    if (shouldBreak || isLast) {
-      chunks.push({
-        startIdx: chunkStart,
-        endIdx: event.idx,
-        events: [...currentChunk],
-      });
-      currentChunk = [];
-      if (!isLast) {
-        chunkStart = events[i + 1].idx;
-      }
-    }
-  }
-
-  return chunks;
-}
 
 /** Extract the readable text from an event's content (may be JSON wrapper). */
 function getContentText(event: Event): string {
@@ -95,77 +19,165 @@ function getContentText(event: Event): string {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Step 2: Condense a chunk into a compact prompt for Claude                 */
+/*  Step 1: Condense ALL events into a single numbered prompt for the LLM     */
 /* -------------------------------------------------------------------------- */
 
-function condenseChunk(chunk: Chunk): string {
+/** Max characters per individual event content in the condensed prompt. */
+const PER_EVENT_CHAR_LIMIT = 1500;
+
+/**
+ * Condense an array of events into a single numbered text block.
+ * Each event is formatted as:  [idx] type (actor): truncated_content
+ */
+function condenseEvents(events: Event[]): string {
   const lines: string[] = [];
-  for (const event of chunk.events) {
+  for (const event of events) {
     const text = getContentText(event);
-    // Truncate very long content (file listings, code dumps) for the LLM prompt
     const truncated =
-      text.length > 2000
-        ? text.slice(0, 1500) + "\n... [truncated, " + text.length + " chars total]"
+      text.length > PER_EVENT_CHAR_LIMIT
+        ? text.slice(0, PER_EVENT_CHAR_LIMIT) +
+          "\n... [truncated, " +
+          text.length +
+          " chars total]"
         : text;
-    lines.push(`[${event.idx}] ${event.type}: ${truncated}`);
+    const actor = event.actor ? ` (${event.actor})` : "";
+    lines.push(`[${event.idx}] ${event.type}${actor}: ${truncated}`);
   }
   return lines.join("\n\n");
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Step 3: Call Claude via ES Inference API to summarize each chunk           */
+/*  Step 2: System prompt — LLM decides section boundaries + summaries        */
 /* -------------------------------------------------------------------------- */
 
-const SYSTEM_PROMPT = `You are an AI agent trajectory analyzer. You receive a chunk of events from an AI coding agent's execution trace (system prompts, AI thoughts, tool calls, tool results).
+const SYSTEM_PROMPT = `You are an AI agent trajectory analyzer. You receive the FULL execution trace of an AI coding agent — system prompts, AI thoughts, tool calls, and tool results — as a numbered list of events.
 
-Your job: Write a SHORT narrative summary of what happened in this chunk. Focus on:
-- What the agent was trying to do
-- What commands/tools it used
-- What happened (success, error, unexpected result)
-- Any notable decisions or mistakes
+Your job: Identify logical SECTIONS in this trajectory. A section is a coherent phase of work — e.g. "exploring the codebase", "reproducing the bug", "implementing a fix", "running tests".
 
-Output format (strict):
-TITLE: <short title, 3-8 words>
-VERDICT: <one of: good, warning, failure>
-SUMMARY: <2-4 sentences describing what happened>
+YOU decide:
+- How many sections there are (could be 2, could be 15 — whatever fits the trajectory)
+- Where each section starts and ends (using the event index numbers [idx])
+- Every event must belong to exactly one section (no gaps, no overlaps)
+
+Output format (strict JSON array):
+[
+  {
+    "start_idx": <first event index in this section>,
+    "end_idx": <last event index in this section>,
+    "title": "<short title, 3-8 words>",
+    "verdict": "<one of: good, warning, failure>",
+    "summary": "<2-4 sentences describing what happened>"
+  }
+]
 
 Rules:
-- TITLE should describe the activity (e.g. "Reproducing the bug", "Fixing transform_in check", "Exploring the codebase")
-- VERDICT: "good" = things went well, "warning" = minor issue or suboptimal approach, "failure" = error occurred or agent got stuck
+- Sections must be contiguous: section N's end_idx + 1 should equal section N+1's start_idx (accounting for actual event indices).
+- TITLE should describe the activity (e.g. "Reproducing the bug", "Fixing the transform check", "Exploring the codebase").
+- VERDICT: "good" = things went well, "warning" = minor issue or suboptimal approach, "failure" = error occurred or agent got stuck.
 - SUMMARY: Be specific about what commands ran and what happened. Reference file names and error types when relevant.
-- Be concise. No markdown formatting.`;
+- Be concise. No markdown formatting in summaries.
+- Output ONLY the JSON array. No other text before or after.`;
 
-async function summarizeChunk(
-  chunk: Chunk
-): Promise<{ title: string; verdict: string; summary: string }> {
+/* -------------------------------------------------------------------------- */
+/*  Step 3: Call Claude via ES Inference API — single pass sectioning          */
+/* -------------------------------------------------------------------------- */
+
+interface LLMSection {
+  start_idx: number;
+  end_idx: number;
+  title: string;
+  verdict: string;
+  summary: string;
+}
+
+/**
+ * Send a condensed event list to Claude and get back an array of sections
+ * with LLM-decided boundaries.
+ */
+async function sectionsFromLLM(condensed: string): Promise<LLMSection[]> {
   const client = getElastic();
-  const condensed = condenseChunk(chunk);
 
   const result = await client.transport.request({
     method: "POST",
     path: "/_inference/completion/.anthropic-claude-4.5-sonnet-completion",
     body: {
-      input: `${SYSTEM_PROMPT}\n\n--- EVENTS ---\n${condensed}\n\n--- END EVENTS ---\nAnalyze this chunk:`,
+      input: `${SYSTEM_PROMPT}\n\n--- EVENTS ---\n${condensed}\n\n--- END EVENTS ---\n\nIdentify the logical sections:`,
     },
   });
 
-  const text = (result as { completion: Array<{ result: string }> }).completion[0]
-    .result;
+  const text = (result as { completion: Array<{ result: string }> })
+    .completion[0].result;
 
-  // Parse the structured response
-  const titleMatch = text.match(/TITLE:\s*(.+)/i);
-  const verdictMatch = text.match(/VERDICT:\s*(\w+)/i);
-  const summaryMatch = text.match(/SUMMARY:\s*([\s\S]+)/i);
+  // Extract JSON array from the response (LLM might wrap in ```json ... ```)
+  const jsonMatch = text.match(/\[[\s\S]*\]/);
+  if (!jsonMatch) {
+    console.error("LLM did not return a JSON array. Raw response:", text);
+    throw new Error("Failed to parse LLM section response");
+  }
 
-  return {
-    title: titleMatch?.[1]?.trim() ?? "Unknown Section",
-    verdict: verdictMatch?.[1]?.trim().toLowerCase() ?? "good",
-    summary: summaryMatch?.[1]?.trim() ?? text.trim(),
-  };
+  const parsed = JSON.parse(jsonMatch[0]) as LLMSection[];
+
+  // Validate basic structure
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error("LLM returned empty or invalid sections array");
+  }
+
+  return parsed;
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Step 4: Embed section with Jina via ES Inference API                      */
+/*  Step 4: Windowed fallback for very long runs                               */
+/* -------------------------------------------------------------------------- */
+
+/** Threshold: if condensed text exceeds this, split into windows. */
+const MAX_CONDENSED_CHARS = 80_000;
+
+/** Window size in events and overlap between windows. */
+const WINDOW_SIZE = 100;
+const WINDOW_OVERLAP = 10;
+
+/**
+ * For long runs, split events into overlapping windows, get sections for
+ * each window, then merge them (dropping duplicate boundary sections from
+ * overlapping regions).
+ */
+async function sectionsFromLLMWindowed(events: Event[]): Promise<LLMSection[]> {
+  const allSections: LLMSection[] = [];
+  let offset = 0;
+
+  while (offset < events.length) {
+    const windowEnd = Math.min(offset + WINDOW_SIZE, events.length);
+    const windowEvents = events.slice(offset, windowEnd);
+    const condensed = condenseEvents(windowEvents);
+
+    const windowSections = await sectionsFromLLM(condensed);
+    allSections.push(...windowSections);
+
+    // Move forward by WINDOW_SIZE - WINDOW_OVERLAP
+    offset += WINDOW_SIZE - WINDOW_OVERLAP;
+  }
+
+  // Deduplicate overlapping sections: keep the one that starts earlier,
+  // and drop any section whose start_idx falls within a previous section's range.
+  const merged: LLMSection[] = [];
+  for (const section of allSections) {
+    const overlaps = merged.some(
+      (existing) =>
+        section.start_idx >= existing.start_idx &&
+        section.start_idx <= existing.end_idx
+    );
+    if (!overlaps) {
+      merged.push(section);
+    }
+  }
+
+  // Sort by start_idx
+  merged.sort((a, b) => a.start_idx - b.start_idx);
+  return merged;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Step 5: Embed section with Jina via ES Inference API                      */
 /* -------------------------------------------------------------------------- */
 
 async function embedSection(text: string): Promise<number[]> {
@@ -183,7 +195,7 @@ async function embedSection(text: string): Promise<number[]> {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Step 5: Full analysis pipeline — chunk → summarize → embed → save         */
+/*  Step 6: Full analysis pipeline — condense → LLM sections → embed → save  */
 /* -------------------------------------------------------------------------- */
 
 export async function analyzeRun(
@@ -199,34 +211,47 @@ export async function analyzeRun(
     refresh: true,
   });
 
-  // Step 1: Chunk
-  const chunks = chunkEvents(events);
-  if (chunks.length === 0) return [];
+  if (events.length === 0) return [];
 
+  // Condense all events
+  const condensed = condenseEvents(events);
+
+  // Decide: single pass or windowed fallback
+  let llmSections: LLMSection[];
+  if (condensed.length > MAX_CONDENSED_CHARS) {
+    console.log(
+      `Run ${runId}: ${events.length} events, ${condensed.length} chars — using windowed approach`
+    );
+    llmSections = await sectionsFromLLMWindowed(events);
+  } else {
+    console.log(
+      `Run ${runId}: ${events.length} events, ${condensed.length} chars — single pass`
+    );
+    llmSections = await sectionsFromLLM(condensed);
+  }
+
+  // Embed each section and save to Elasticsearch
   const sections: Section[] = [];
 
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
+  for (let i = 0; i < llmSections.length; i++) {
+    const llmSection = llmSections[i];
 
-    // Step 2: Summarize with Claude via ES
-    const { title, verdict, summary } = await summarizeChunk(chunk);
-
-    // Step 3: Embed with Jina via ES
-    const embeddingText = `${title}: ${summary}`;
+    // Embed with Jina via ES
+    const embeddingText = `${llmSection.title}: ${llmSection.summary}`;
     const embedding = await embedSection(embeddingText);
 
     const section: Section & { embedding?: number[] } = {
       id: `${runId}-section-${i}`,
       run_id: runId,
-      start_idx: chunk.startIdx,
-      end_idx: chunk.endIdx,
-      label: title,
-      what_happened: summary,
-      verdict: verdict as "good" | "warning" | "failure",
+      start_idx: llmSection.start_idx,
+      end_idx: llmSection.end_idx,
+      label: llmSection.title,
+      what_happened: llmSection.summary,
+      verdict: llmSection.verdict as "good" | "warning" | "failure",
       embedding,
     };
 
-    // Step 4: Save to Elasticsearch
+    // Save to Elasticsearch
     await client.index({
       index: SECTIONS_INDEX,
       id: section.id,

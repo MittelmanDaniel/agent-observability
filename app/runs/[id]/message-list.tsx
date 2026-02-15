@@ -42,6 +42,68 @@ function splitAiMessage(text: string): { thought: string; command: string | null
   return { thought: text, command: null };
 }
 
+/**
+ * Group events so that consecutive tool_call + tool_result pairs
+ * become a single render item. Everything else stays individual.
+ */
+type RenderItem =
+  | { kind: "event"; event: Event }
+  | { kind: "tool_pair"; call: Event; result: Event };
+
+function groupToolPairs(events: Event[]): RenderItem[] {
+  const items: RenderItem[] = [];
+  let i = 0;
+  while (i < events.length) {
+    const ev = events[i];
+    // If this is a tool_call followed by a tool_result, pair them
+    if (
+      ev.type === "tool_call" &&
+      i + 1 < events.length &&
+      events[i + 1].type === "tool_result"
+    ) {
+      items.push({ kind: "tool_pair", call: ev, result: events[i + 1] });
+      i += 2;
+    } else {
+      items.push({ kind: "event", event: ev });
+      i += 1;
+    }
+  }
+  return items;
+}
+
+/* ── combined tool call + result block ─────────────────────────────── */
+
+function ToolBlock({ call, result }: { call: Event; result: Event }) {
+  const toolName = call.actor || "Tool";
+  const callText = extractText(call);
+  const resultText = extractText(result);
+
+  return (
+    <div className="max-w-[90%] rounded-xl overflow-hidden shadow-sm border border-violet-200 dark:border-violet-800/60">
+      {/* Top: tool call */}
+      <div className="bg-violet-50 px-4 py-3 dark:bg-violet-950/40">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-violet-500 dark:text-violet-400 mb-1.5 block">
+          {toolName}
+        </span>
+        <pre className="whitespace-pre-wrap wrap-break-word text-sm text-violet-900 dark:text-violet-200 font-mono leading-relaxed">
+          {callText}
+        </pre>
+      </div>
+      {/* Divider */}
+      <div className="h-px bg-violet-200 dark:bg-violet-800/60" />
+      {/* Bottom: result */}
+      <div className="bg-zinc-50 px-4 py-3 dark:bg-zinc-800/60 max-h-72 overflow-y-auto">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-1.5 block">
+          Output
+        </span>
+        <pre className="whitespace-pre-wrap wrap-break-word text-sm text-zinc-700 dark:text-zinc-300 font-mono leading-relaxed">
+          {resultText}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
 /* ── single message bubble ──────────────────────────────────────────── */
 
 function MessageBubble({ event }: { event: Event }) {
@@ -49,7 +111,7 @@ function MessageBubble({ event }: { event: Event }) {
   const text = extractText(event);
 
   // Agent messages: show on the left with blue accent
-  if (role === "ai") {
+  if (role === "ai" || role === "assistant") {
     const { thought, command } = splitAiMessage(text);
     return (
       <div className="flex flex-col gap-2 max-w-[85%]">
@@ -67,7 +129,7 @@ function MessageBubble({ event }: { event: Event }) {
           </div>
         )}
 
-        {/* Command */}
+        {/* Command (SWE-Agent style inline tool call) */}
         {command && (
           <div className="rounded-xl rounded-tl-sm bg-violet-50 px-4 py-3 shadow-sm border border-violet-200 dark:bg-violet-950/40 dark:border-violet-800">
             <span className="text-[10px] font-bold uppercase tracking-wider text-violet-500 dark:text-violet-400 mb-1 block">
@@ -82,7 +144,41 @@ function MessageBubble({ event }: { event: Event }) {
     );
   }
 
-  // User / tool result messages: show on the right
+  // Standalone tool_call (no paired result — rare)
+  if (role === "tool_call") {
+    const toolName = event.actor || "Tool";
+    return (
+      <div className="max-w-[90%] rounded-xl overflow-hidden shadow-sm border border-violet-200 dark:border-violet-800/60">
+        <div className="bg-violet-50 px-4 py-3 dark:bg-violet-950/40">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-violet-500 dark:text-violet-400 mb-1.5 block">
+            {toolName}
+          </span>
+          <pre className="whitespace-pre-wrap wrap-break-word text-sm text-violet-900 dark:text-violet-200 font-mono leading-relaxed">
+            {text}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  // Standalone tool_result (no paired call — rare)
+  if (role === "tool_result") {
+    return (
+      <div className="max-w-[90%] rounded-xl overflow-hidden shadow-sm border border-zinc-200 dark:border-zinc-700">
+        <div className="bg-zinc-50 px-4 py-3 dark:bg-zinc-800/60 max-h-72 overflow-y-auto">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-1.5 block">
+            Output
+          </span>
+          <pre className="whitespace-pre-wrap wrap-break-word text-sm text-zinc-700 dark:text-zinc-300 font-mono leading-relaxed">
+            {text}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  // User messages: show on the right
+  // For SWE-Agent data, "user" events after idx 1 are actually tool outputs
   if (role === "user") {
     const isToolResult = event.idx > 1;
     return (
@@ -189,24 +285,38 @@ export function MessageList({
 
   return (
     <div className="space-y-4 pb-20">
-      {groups.map((group) => (
-        <div
-          key={group.section?.id ?? `ungrouped-${group.sectionIndex}`}
-          ref={group.section ? refCallback(group.sectionIndex) : undefined}
-        >
-          {/* Section divider */}
-          {group.section && (
-            <SectionDivider section={group.section} index={group.sectionIndex} />
-          )}
+      {groups.map((group) => {
+        const renderItems = groupToolPairs(group.events);
+        return (
+          <div
+            key={group.section?.id ?? `ungrouped-${group.sectionIndex}`}
+            ref={group.section ? refCallback(group.sectionIndex) : undefined}
+          >
+            {/* Section divider */}
+            {group.section && (
+              <SectionDivider section={group.section} index={group.sectionIndex} />
+            )}
 
-          {/* Messages */}
-          <div className="space-y-4 py-2">
-            {group.events.map((event) => (
-              <MessageBubble key={`${event.run_id}-${event.idx}`} event={event} />
-            ))}
+            {/* Messages */}
+            <div className="space-y-4 py-2">
+              {renderItems.map((item) =>
+                item.kind === "tool_pair" ? (
+                  <ToolBlock
+                    key={`${item.call.run_id}-${item.call.idx}`}
+                    call={item.call}
+                    result={item.result}
+                  />
+                ) : (
+                  <MessageBubble
+                    key={`${item.event.run_id}-${item.event.idx}`}
+                    event={item.event}
+                  />
+                )
+              )}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

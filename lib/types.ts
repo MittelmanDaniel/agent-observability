@@ -1,4 +1,4 @@
-export type RunSource = "claude_sdk" | "custom" | "oz" | "stagehand";
+export type RunSource = "claude_sdk" | "custom" | "oz" | "stagehand" | "trace";
 
 export interface Run {
   id: string;
@@ -7,6 +7,19 @@ export interface Run {
   status: string;
   started_at: string;
   ended_at: string;
+  // SWE-Agent dataset fields
+  model_name?: string;
+  exit_status?: string;
+  generated_patch?: string;
+  eval_score?: number | null;
+  eval_passed?: number;
+  eval_failed?: number;
+  eval_errors?: number;
+  eval_total?: number;
+  // TRACE dataset specific fields
+  trace_label?: string;
+  trace_label_description?: string;
+  trace_trajectory_id?: string;
 }
 
 export type EventType =
@@ -18,6 +31,7 @@ export type EventType =
   | "user_feedback"
   | "system"
   | "ai"
+  | "assistant"
   | "user";
 
 export interface Event {
